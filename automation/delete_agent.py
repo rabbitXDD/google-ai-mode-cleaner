@@ -1,9 +1,8 @@
 """AI Takeout Cleaner - Playwright Delete Agent (Accurate Sidebar Selector)"""
 import asyncio
 import json
-import random
+import os
 import re
-from pathlib import Path
 
 from playwright.async_api import async_playwright
 
@@ -25,7 +24,7 @@ def normalize_text(text: str) -> str:
 
 
 def is_content_match(web_content: str, delete_items: list) -> int:
-    """Check if the sidebar session title matches any item in delete queue with higher tolerance."""
+    """Check if the sidebar session title matches any item in delete queue."""
     norm_web = normalize_text(web_content)
     if not norm_web:
         return -1
@@ -33,28 +32,24 @@ def is_content_match(web_content: str, delete_items: list) -> int:
     for idx, item in enumerate(delete_items):
         # 1. Match against last_prompt
         norm_last = normalize_text(item.get("last_prompt", ""))
-        if norm_last:
-            # Check if one is a substring of the other (at least 5 characters overlap)
-            min_len = min(len(norm_last), len(norm_web), 15)
-            if min_len >= 4:
-                if norm_last[:min_len] in norm_web or norm_web[:min_len] in norm_last:
-                    return idx
+        if norm_last and norm_last in norm_web:
+            return idx
 
         # 2. Match against title / summary
         norm_title = normalize_text(item.get("title", ""))
-        if norm_title:
-            min_len = min(len(norm_title), len(norm_web), 15)
-            if min_len >= 4:
-                if norm_title[:min_len] in norm_web or norm_web[:min_len] in norm_title:
-                    return idx
+        if norm_title and norm_title in norm_web:
+            return idx
 
         # 3. Match against original query
         orig = item.get("original_title", "").replace("Searched for ", "")
         norm_orig = normalize_text(orig)
-        if norm_orig:
-            min_len = min(len(norm_orig), len(norm_web), 15)
-            if min_len >= 4:
-                if norm_orig[:min_len] in norm_web or norm_web[:min_len] in norm_orig:
+        if norm_orig and norm_orig in norm_web:
+            return idx
+
+        # 4. Partial match - if web content contains key parts of search query
+        if len(norm_web) >= 10:
+            for key in [norm_last, norm_title, norm_orig]:
+                if key and len(key) >= 10 and (key[:10] in norm_web):
                     return idx
 
     return -1
@@ -65,16 +60,20 @@ async def delete_session_by_element(page, session_elem) -> bool:
     try:
         # Based on inspected HTML:
         # <button role="button" aria-label="「...」的其他選項" class="fMed7">
-        options_btn = await session_elem.query_selector('button.fMed7, button[aria-label*="其他選項"], button[aria-label*="Other options"]')
+        options_btn = await session_elem.query_selector('button.fMed7, button[aria-label*="其他選項"], button[aria-label*="Other options"], button[role="button"]:has(svg)')
         
         if not options_btn:
             # Hover over the item to reveal the button if hidden
             await session_elem.hover()
             await asyncio.sleep(0.3)
-            options_btn = await session_elem.query_selector('button.fMed7, button[aria-label*="其他選項"], button[aria-label*="Other options"]')
+            options_btn = await session_elem.query_selector('button.fMed7, button[aria-label*="其他選項"], button[aria-label*="Other options"], button[role="button"]:has(svg)')
 
         if not options_btn:
-            print("   ❌ Could not find options button (.fMed7)")
+            # Fallback: try finding any button or clickable icon inside the item row
+            options_btn = await session_elem.query_selector('button, [role="button"]')
+
+        if not options_btn:
+            print("   ❌ Could not find options button")
             return False
 
         await options_btn.dispatch_event("click")
@@ -144,19 +143,149 @@ async def delete_session_by_element(page, session_elem) -> bool:
     return False
 
 
-async def run_batch_deletion(delete_queue: list, headless: bool = False) -> None:
+async def dump_page_structure(page, label="dump"):
+    """Dump page HTML and interactive elements for debugging."""
+    html = await page.content()
+    dump_path = f"debug_{label}.html"
+    with open(dump_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"   📄 Page structure dumped to {dump_path}")
+
+    # Also dump all li elements with their classes
+    li_info = await page.evaluate("""() => {
+        const lis = document.querySelectorAll('li');
+        const results = [];
+        lis.forEach((li, i) => {
+            const classes = li.className;
+            const text = li.textContent?.substring(0, 80) || '';
+            const hasChildren = li.children.length > 0;
+            if (text.trim()) {
+                results.push({index: i, class: classes, text: text, childCount: li.children.length});
+            }
+        });
+        return results.slice(0, 50);
+    }""")
+    print(f"   📋 Found {len(li_info)} non-empty <li> elements:")
+    for info in li_info:
+        print(f"      [{info['index']}] class='{info['class']}' children={info['childCount']} text='{info['text']}'")
+
+
+async def find_sidebar_items(page) -> list:
+    """Find sidebar session items strictly under '最近的討論串' section."""
+    
+    # Find the '最近的討論串' container using evaluate
+    section_container = await page.evaluate("""() => {
+        const allElements = document.querySelectorAll('*');
+        for (const el of allElements) {
+            if (el.textContent && el.textContent.includes('最近的討論串')) {
+                let current = el;
+                while (current && current.tagName !== 'BODY') {
+                    if (current.nodeType === Node.ELEMENT_NODE) {
+                        const classes = current.className || '';
+                        if ((typeof classes === 'string' && (classes.includes('sidebar') || classes.includes('drawer') || 
+                            classes.includes('u1Qo0b'))) || current.getAttribute('role') === 'navigation') {
+                            return current;
+                        }
+                    }
+                    current = current.parentElement || null;
+                }
+            }
+        }
+        return null;
+    }""")
+    
+    selectors = [
+        '[role="listitem"]:has(.Se0jFd)',
+        'div:has(> .Se0jFd)',
+        '[role="listitem"]',
+    ]
+    
+    for sel in selectors:
+        items = await page.query_selector_all(sel)
+        
+        if items:
+            valid_items = []
+            for item in items:
+                title_el = await item.query_selector('.Se0jFd')
+                if title_el:
+                    text = await title_el.inner_text()
+                    if text and text.strip() and "最近的討論串" not in text:
+                        valid_items.append(item)
+            
+            if valid_items:
+                print(f"   🔍 Found {len(valid_items)} verified session items under '最近的討論串' with selector: {sel}")
+                return valid_items, sel
+
+    return [], None
+
+
+async def find_title_element(element):
+    """Find the title element inside a sidebar item using multiple fallback selectors."""
+    title_selectors = [
+        '.Se0jFd',
+        '[class*="title"]',
+        'div[class*="text"]',
+        'span[class*="text"]',
+        'a div',
+        'div > div',
+    ]
+    for sel in title_selectors:
+        el = await element.query_selector(sel)
+        if el:
+            text = await el.inner_text()
+            if text and text.strip():
+                return el
+    # Fallback: get all text content
+    return element
+
+
+async def debug_detect_sessions(page):
+    print("🔍 Attempting to detect session titles via JS...")
+    items = await page.evaluate("""
+        () => {
+            const results = [];
+            // 抓取所有包含特定文字長度的元素，且看看是否有刪除按鈕特徵的鄰居
+            const allElements = document.querySelectorAll('*');
+            allElements.forEach(el => {
+                if (el.children.length === 0 && el.innerText?.trim().length > 5 && el.innerText.length < 100) {
+                    const parent = el.parentElement;
+                    if (parent && parent.innerText.length < 300) {
+                        results.push({
+                            text: el.innerText.trim(),
+                            tag: el.tagName,
+                            class: el.className,
+                            parentClass: parent.className
+                        });
+                    }
+                }
+            });
+            return results.slice(0, 100);
+        }
+    """)
+    # 這裡我們只印出那些看起來像標題的（排除導航欄）
+    exclude = ['探索', '更多', '設定', '歷史記錄', '隱私權', '條款', '登入', '管理', '查看']
+    count = 0
+    for item in items:
+        if not any(ex in item['text'] for ex in exclude):
+            print(f"   [{count}] {item['text'][:50]} | tag: {item['tag']} | class: {item['class']} | pClass: {item['parentClass']}")
+            count += 1
+            if count > 30: break
+
+async def run_batch_deletion(delete_queue: list, headless: bool = False, debug: bool = False) -> None:
     """Scan sidebar sessions, match, and delete."""
+    
+    # ... (existing setup code)
+    
+    # 執行偵測
     async with async_playwright() as p:
-        profile_dir = Path.cwd() / "automation/chrome_profile"
-        profile_dir.mkdir(parents=True, exist_ok=True)
+        # 這會在你專案目錄下建立一個名為 user_data 的資料夾來儲存登入狀態
+        user_data_dir = os.path.join(os.getcwd(), "user_data")
 
         context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            headless=headless,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-            ignore_default_args=["--enable-automation"],
+            user_data_dir,
+            headless=False,  # 必須是 False，你才能手動處理第一次登入
+            args=["--disable-blink-features=AutomationControlled"]  # 隱藏自動化特徵
         )
-        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.pages[0] if context.pages else await context.new_page()
 
         print("🔗 Navigating to Google AI Mode...")
@@ -164,12 +293,109 @@ async def run_batch_deletion(delete_queue: list, headless: bool = False) -> None
 
         # Manual Login Check
         if "accounts.google.com" in page.url:
-            print("\n🔐 [ACTION REQUIRED] Please log in. Waiting up to 10 mins...")
-            await page.wait_for_url(lambda url: "accounts.google.com" not in url, timeout=600000)
+            print("\n🔐 [ACTION REQUIRED] Please log in. Waiting up to 15 mins...")
+            await page.wait_for_url(lambda url: "accounts.google.com" not in url, timeout=900000)
             await page.goto(AI_MODE_URL)
 
+        # Wait for page to settle
         await page.wait_for_load_state("domcontentloaded")
-        await asyncio.sleep(8)  # 給予充足時間讓側邊欄與對話載入完成
+        await asyncio.sleep(5)
+        
+        if debug:
+            await debug_detect_sessions(page)
+
+        # Try multiple approaches to find sidebar items
+        # 1. Try finding with our sidebar selectors first
+        session_items, used_sel = await find_sidebar_items(page)
+        
+        if not session_items:
+            print("   ⚠️ No sidebar items found with standard selectors. Trying to open sidebar...")
+            
+            # Try common sidebar container elements
+            sidebar_container_selectors = [
+                '[role="navigation"]',
+                'div[role="navigation"]',
+                '[class*="sidebar"]',
+                '[class*="drawer"]',
+                '[class*="history"]',
+                '[data-ved*="sidebar"]',
+                '.rQTE8b',
+                '[jsname="DU0NJ"]',
+                '[jsname="HJoEPd"]',
+            ]
+            
+            for sel in sidebar_container_selectors:
+                container = await page.query_selector(sel)
+                if container:
+                    print(f"   🔍 Found sidebar container: {sel}")
+                    
+                    # Try multiple expansion methods
+                    # Method 1: Click an expand/collapse button inside the container
+                    expand_btn = await container.query_selector('button, a[role="button"], [role="button"], a.ilLN6b')
+                    if expand_btn:
+                        print("   📂 Expanding sidebar (Method 1)...")
+                        try:
+                            await expand_btn.evaluate("el => el.click()")
+                            await asyncio.sleep(3)
+                        except:
+                            pass
+                    
+                    # Method 2: Try clicking on the AI 模式记錄 button directly
+                    ai_mode_record_btn = await page.query_selector('a.ilLN6b, a[title="AI 模式記錄"], button[aria-label="AI 模式記錄"][role="button"]')
+                    if ai_mode_record_btn:
+                        print("   📂 Expanding sidebar (Method 2 - AI 模式記錄)...")
+                        try:
+                            await ai_mode_record_btn.evaluate("el => el.click()")
+                            await asyncio.sleep(3)
+                        except:
+                            pass
+                    
+                    break
+        
+        # Re-try to find sidebar items after any expansion attempts
+        session_items, used_sel = await find_sidebar_items(page)
+        if not session_items:
+            print("   ⚠️ Still no sidebar items found after expansion attempts")
+            
+            # As a last resort, try to find any elements that might be sidebar items
+            # by checking for known title patterns
+            print("   🔍 Trying to find elements with potential sidebar titles...")
+            potential_items = await page.evaluate("""
+                const results = [];
+                const elements = document.querySelectorAll('li, [role=\"listitem\"], [class*="sidebar"], [class*="history"], [class*="conversation"]');
+                elements.forEach(el => {
+                    const text = el.textContent?.trim();
+                    if (text && (text.length > 10 && text.length < 200) && 
+                        (text.includes('chat') || text.includes('对话') || 
+                         text.includes('conversation') || text.includes('history'))) {
+                        results.push(el);
+                    }
+                });
+                return results.length;
+            """)
+            
+            if potential_items > 0:
+                print(f"   🔍 Found {potential_items} potential sidebar elements in fallback")
+            
+            await context.close()
+            return
+
+        # Debug: dump page structure
+        if debug:
+            print("\n🔧 DEBUG MODE: Dumping page structure...")
+            await dump_page_structure(page, "after_expand")
+            session_items, used_sel = await find_sidebar_items(page)
+            if not session_items:
+                print("   ❌ No sidebar items found with any known selector!")
+            await context.close()
+            return
+
+        # Find sidebar items with fallback selectors
+        session_items, sidebar_selector = await find_sidebar_items(page)
+        if not session_items:
+            print("   ❌ Could not find sidebar items. Run with debug=True to inspect page structure.")
+            await context.close()
+            return
 
         current_queue = list(delete_queue)
         print(f"🚀 Starting scan. Total items in delete queue: {len(current_queue)}")
@@ -181,18 +407,24 @@ async def run_batch_deletion(delete_queue: list, headless: bool = False) -> None
                 print("\n🎉 All target items processed!")
                 break
 
-            # Find all sidebar session items matching class 'j8c53'
-            session_items = await page.query_selector_all('li.j8c53')
+            # Re-find items each iteration (DOM may change after deletion)
+            session_items, _ = await find_sidebar_items(page)
+            if not session_items:
+                print("   ⚠️ No sidebar items found, waiting...")
+                await asyncio.sleep(3)
+                session_items, _ = await find_sidebar_items(page)
+                if not session_items:
+                    break
             
             target_elem = None
             matched_idx = -1
             matched_title = ""
 
             for li in session_items:
-                title_elem = await li.query_selector('.Se0jFd')
+                title_elem = await find_title_element(li)
                 if not title_elem:
                     continue
-                
+
                 title_text = (await title_elem.inner_text()).strip()
                 if not title_text or title_text in processed_titles:
                     continue
@@ -212,7 +444,7 @@ async def run_batch_deletion(delete_queue: list, headless: bool = False) -> None
                 # If no match is found, scroll the last visible item into view to trigger lazy loading
                 if session_items:
                     last_item = session_items[-1]
-                    last_title_elem = await last_item.query_selector('.Se0jFd')
+                    last_title_elem = await find_title_element(last_item)
                     last_title = (await last_title_elem.inner_text()).strip() if last_title_elem else ""
                     print(f"🔄 Scrolling down to load more history... (Last visible: '{last_title[:20]}')")
                     
@@ -221,7 +453,7 @@ async def run_batch_deletion(delete_queue: list, headless: bool = False) -> None
                     await asyncio.sleep(2)  # Wait for API requests
                     
                     # Double check if any new sessions are loaded, if so, continue loop
-                    new_session_items = await page.query_selector_all('li.j8c53')
+                    new_session_items, _ = await find_sidebar_items(page)
                     if len(new_session_items) > len(session_items):
                         continue
                 
@@ -245,5 +477,7 @@ async def run_batch_deletion(delete_queue: list, headless: bool = False) -> None
 
 
 if __name__ == "__main__":
+    import sys
     delete_queue = asyncio.run(load_delete_queue("data/delete_queue.json"))
-    asyncio.run(run_batch_deletion(delete_queue, headless=False))
+    debug_mode = "--debug" in sys.argv
+    asyncio.run(run_batch_deletion(delete_queue, headless=False, debug=debug_mode))
